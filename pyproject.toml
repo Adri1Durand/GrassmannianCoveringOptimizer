@@ -12,7 +12,7 @@ authors = [
 ]
 dependencies = [
     "numpy",
-    "PyNomadBBO",   # ou "nomad", à confirmer avec pip show
+    "PyNomadBBO", 
 ]
 
 [project.urls]
