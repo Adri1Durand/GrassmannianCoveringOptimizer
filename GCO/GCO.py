@@ -1,11 +1,11 @@
 import os
 
 import numpy as np
-from utils.extended_var import *
-from utils.doe_class import DOE
-from utils.domain import BoxScaler
+from .utils.extended_var import *
+from .utils.doe_class import DOE
+from .utils.domain import BoxScaler
 #from SSO_algo.utils.subspace_class import Subspace
-from utils.nomad_io import write_nomad_cache, NomadCacheFormat,PointKey
+from .utils.nomad_io import write_nomad_cache, NomadCacheFormat,PointKey
 
 import PyNomad
 import warnings
