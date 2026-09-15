@@ -13,6 +13,7 @@ authors = [
 dependencies = [
     "numpy",
     "PyNomadBBO", 
+    "scikit-learn",
 ]
 
 [project.urls]
