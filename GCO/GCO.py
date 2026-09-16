@@ -34,6 +34,29 @@ class GCO :
                 "Optimization stops when the suboptimizer's scale parameter falls below this value."
             ),
         },
+        "max_cache_point": {
+            "type": int,
+            "default": 900,  # marge de sécurité sous la limite de 1000 lignes de NOMAD
+            "desc": (
+                "Maximum number of points written to the NOMAD cache file. "
+                "If the DOE history exceeds this number, points are selected "
+                "via 'cache_selection_method'."
+            ),
+        },
+
+        "cache_selection_method": {
+            "type": str,
+            "default": "closest_subspace",
+            "choices": {"random", "closest_subspace"},
+            "desc": (
+                "Method used to select which points are kept in the cache when "
+                "the DOE history exceeds max_cache_point. "
+                "'random': uniform random subsample. "
+                "'closest_subspace': keep points with smallest projection residual "
+                "||A A^T x - x|| onto the current subspace."
+            ),
+        },
+
         "subspace_selection": {
             "type": str,
             "default": "PLS",
@@ -295,9 +318,9 @@ class GCO :
         V_k = self.augmentation_isomorphism(omega_k) # From Gr(p-1,n-1) to Gr(p,n)
 
         self.curent_subspace = V_k
-        self._update_latent_function(V_k)
-        self._update_latent_doe(V_k)
-        self._update_latent_bound(V_k) 
+        self._update_latent_function(V_k)   # met à jour self.A et self.latent_fun
+        self._update_latent_doe(V_k)        # met à jour self.latent_doe (avec sélection cache)
+        self._update_latent_bound(V_k)      # met à jour self.latent_lb / self.latent_ub
 
         return omega_k, h_k
 
@@ -804,8 +827,53 @@ class GCO :
         """Update the latent DOE with the new subspace V_k."""
         X, y = self.doe.Xy()
         self.latent_doe = DOE(dim=V_k.shape[1])
-        self.latent_doe.add(X@V_k, y=y)
+
+        X_keep, y_keep = self._select_cache_points(X, y, V_k)
+        self.latent_doe.add(X_keep @ V_k, y=y_keep)
         return self
+
+    def _select_cache_points(self, X: np.ndarray, y: np.ndarray, V_k: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Reduce the DOE history to at most max_cache_point points, to respect
+        NOMAD's cache file line limit, using the method specified in
+        self.opt['cache_selection_method'].
+
+        Parameters
+        ----------
+        X : ndarray of shape (n_points, n)
+            Historical points in the original (unit box) space.
+        y : ndarray of shape (n_points,)
+            Corresponding objective values.
+        V_k : ndarray of shape (n, p)
+            Current subspace basis (orthonormal columns).
+
+        Returns
+        -------
+        X_keep : ndarray of shape (min(n_points, max_cache_point), n)
+        y_keep : ndarray of shape (min(n_points, max_cache_point),)
+        """
+        max_points = self.opt.get("max_cache_point", 900)
+        n_points = X.shape[0]
+
+        if n_points <= max_points:
+            return X, y
+
+        method = self.opt.get("cache_selection_method", "closest_subspace")
+
+        if method == "random":
+            rng = np.random.default_rng()
+            idx = rng.choice(n_points, size=max_points, replace=False)
+
+        elif method == "closest_subspace":
+            # Residual of orthogonal projection onto span(V_k): ||V_k V_k^T x - x||
+            X_proj = X @ V_k @ V_k.T
+            residuals = np.linalg.norm(X_proj - X, axis=1)
+            idx = np.argsort(residuals)[:max_points]
+
+        else:
+            raise ValueError(f"Unknown cache_selection_method: {method}")
+
+        return X[idx], y[idx]
     
     # --- Other tools --- #
     def _scale_function(self,fun) :

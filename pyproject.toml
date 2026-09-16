@@ -14,6 +14,7 @@ dependencies = [
     "numpy",
     "PyNomadBBO", 
     "scikit-learn",
+    "pymanopt"
 ]
 
 [project.urls]
