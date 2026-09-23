@@ -56,6 +56,17 @@ class GCO :
                 "||A A^T x - x|| onto the current subspace."
             ),
         },
+        "cache_projection_threshold": {
+            "type": float,
+            "default": 0.0025,
+            "desc": (
+                "Projection residual coefficient for points kept in the latent DOE. "
+                "The effective threshold is this value times sqrt(n), so a value "
+                "of 0.0025 means 0.0025*sqrt(n). Only points satisfying "
+                "||V_k V_k^T x - x|| <= the effective threshold are retained. "
+                "None disables this filter."
+            ),
+        },
 
         "subspace_selection": {
             "type": str,
@@ -196,6 +207,9 @@ class GCO :
         
 
         self.p = int(self.opt["subspace_dimension"])
+
+        if self.opt["cache_projection_threshold"] is not None:
+            self.opt["cache_projection_threshold"] *= np.sqrt(self.n)
 
         # Constants of CGO :
         
@@ -853,7 +867,27 @@ class GCO :
         y_keep : ndarray of shape (min(n_points, max_cache_point),)
         """
         max_points = self.opt.get("max_cache_point", 900)
+        threshold = self.opt.get("cache_projection_threshold")
+
+        if threshold is not None and threshold < 0:
+            raise ValueError("cache_projection_threshold must be non-negative or None.")
+
         n_points = X.shape[0]
+        residuals = None
+
+        if threshold is not None:
+            X_proj = X @ V_k @ V_k.T
+            residuals = np.linalg.norm(X_proj - X, axis=1)
+            eligible = residuals <= threshold
+            X = X[eligible]
+            y = y[eligible]
+            n_points = X.shape[0]
+
+            if n_points == 0:
+                raise ValueError(
+                    "cache_projection_threshold filtered out every DOE point. "
+                    "Increase the threshold or disable the filter."
+                )
 
         if n_points <= max_points:
             return X, y
@@ -866,8 +900,9 @@ class GCO :
 
         elif method == "closest_subspace":
             # Residual of orthogonal projection onto span(V_k): ||V_k V_k^T x - x||
-            X_proj = X @ V_k @ V_k.T
-            residuals = np.linalg.norm(X_proj - X, axis=1)
+            if residuals is None:
+                X_proj = X @ V_k @ V_k.T
+                residuals = np.linalg.norm(X_proj - X, axis=1)
             idx = np.argsort(residuals)[:max_points]
 
         else:
@@ -990,8 +1025,7 @@ def mads_suboptimizer(fun, sigma_k, initial_doe, budget=None, ub=None, lb=None, 
     X,y = initial_doe.Xy()
     best_idx = np.argmin(y)
     x0 = X[best_idx].tolist()
-    result = PyNomad.optimize(bb,x0,lb,ub,params)
-
+    _ = PyNomad.optimize(bb,x0,lb,ub,params)
     return Zk, Fk, n_eval
 
 def doe_to_rounded_map(doe: DOE, decimals: int) -> dict[PointKey, float]:
@@ -1019,7 +1053,7 @@ if __name__ == "__main__" :
     from pathlib import Path
     dossier_parent = Path(__file__).resolve().parent.parent
     sys.path.append(str(dossier_parent))
-    from Folder_of_test.test_function import *
+    #from Folder_of_test.test_function import *
     from scipy.stats import qmc
 
     n = 400
@@ -1037,6 +1071,11 @@ if __name__ == "__main__" :
     seed = 0
 
     pb_name = "rosenbrock"
+
+    def rosenbrock(x):
+        """Rosenbrock function in n dimensions."""
+        x = np.asarray(x)
+        return sum(100.0 * (x[1:] - x[:-1] ** 2) ** 2 + (1 - x[:-1]) ** 2)
 
     _gco = GCO(rosenbrock,vars_prop=var,opt={"file_path": f"GCO(MADS,PLS,p10)_{pb_name}.txt", "subspace_dimension" : 10, "subspace_selection" : "PLS"})
 
