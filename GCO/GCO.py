@@ -1,4 +1,5 @@
 import os
+import time
 
 import numpy as np
 from .utils.extended_var import *
@@ -17,6 +18,19 @@ class GCO :
             "type": str,
             "default": "log_GCO.txt",
             "desc": "Path to the logfile where optimization successes are recorded.",
+        },
+        "output_columns": {
+            "type": list,
+            "default": ["BBE", "OBJ"],
+            "choices": {"BBE", "OBJ", "TIME"},
+            "desc": (
+                "Columns written in the logfile, in order. Allowed entries: "
+                "'BBE' (cumulative number of black-box evaluations), "
+                "'OBJ' (objective value), "
+                "'TIME' (wall-clock seconds elapsed since the start of the "
+                "optimization when the black-box evaluation giving OBJ finished). "
+                "Example: ['BBE', 'OBJ', 'TIME']."
+            ),
         },
         "subspace_dimension": {
             "type": int,
@@ -163,7 +177,15 @@ class GCO :
                     )
 
             # --- Choices checking ---
-            if "choices" in spec and value not in spec["choices"]:
+            if "choices" in spec and isinstance(value, list):
+                bad = [v for v in value if v not in spec["choices"]]
+                if bad or not value:
+                    raise ValueError(
+                        f"Option '{key}' must be a non-empty list with entries in "
+                        f"{sorted(spec['choices'])}, got {value}."
+                    )
+                value = list(value)
+            elif "choices" in spec and value not in spec["choices"]:
                 raise ValueError(
                     f"Option '{key}' must be one of {sorted(spec['choices'])}, "
                     f"got '{value}'."
@@ -195,6 +217,9 @@ class GCO :
 
         # Saving properties :
         self.logfile_path = self.opt["file_path"]
+        self.output_columns = self.opt["output_columns"]
+        self._eval_times = []  # timestamp of each black-box call
+        self._t0 = time.perf_counter()
         self.n = int(vars_prop["dim"])
 
         self._init_logfile()
@@ -245,6 +270,8 @@ class GCO :
         n,p = self.n,self.p
         self.ratio = 2*n*(n-1) / ( 2*n*(n-1) + 3*(p-1)*(n-2) )
 
+        self._t0 = time.perf_counter()  # reference for the TIME column
+        self._eval_times = []
         tot_eval, k, h_k, sigma_k = 0, 0, self.h_0, self.sigma_0
         W = [] # list of extended variables
         h = []
@@ -257,7 +284,7 @@ class GCO :
         for i, (x_i, f_i) in enumerate(zip(X0, F0)):
             if f_i < f_ref:
                 f_ref = f_i
-                self._write_logfile(bbe=i + 1, f_val=f_i, x=x_i)
+                self._write_logfile(bbe=i + 1, f_val=f_i, x=x_i, elapsed=0.0)
         
         tot_eval += len(F0)
 
@@ -915,7 +942,9 @@ class GCO :
         """Scale the function to the unit box [-1, 1]^n."""
         def scaled_fun(z) :
             x = self.scaler.from_unit(z)
-            return fun(x)
+            val = fun(x)
+            self._eval_times.append(time.perf_counter())
+            return val
         return scaled_fun
     
     def _update_doe(self, Xk, Fk) :
@@ -928,12 +957,13 @@ class GCO :
         if os.path.exists(self.logfile_path):
             os.remove(self.logfile_path)
 
-        x_header = "  ".join(f"X{i}" for i in range(self.n))
         with open(self.logfile_path, "w") as f:
-            f.write(f"BBE  OBJ  \n")
+            f.write("  ".join(self.output_columns) + "  \n")
 
     def save_data(self,Xk,Fk,f_ref,tot_eval) :
         # --- Log all intra-iteration successes ---
+        # Each entry of Fk corresponds to exactly one black-box call, in order.
+        times = self._eval_times[-len(Fk):] if len(Fk) else []
         for i, (x_i, f_i) in enumerate(zip(Xk, Fk)):
             if f_i < f_ref:
                 f_ref = f_i
@@ -941,9 +971,10 @@ class GCO :
                     bbe=tot_eval + i + 1,
                     f_val=f_i,
                     x=x_i,
+                    elapsed=times[i] - self._t0 if i < len(times) else float("nan"),
                 )
 
-    def _write_logfile(self, bbe: int, f_val: float, x: np.ndarray) -> None:
+    def _write_logfile(self, bbe: int, f_val: float, x: np.ndarray, elapsed: float = float("nan")) -> None:
         """
         Append a success entry to the logfile.
 
@@ -952,14 +983,20 @@ class GCO :
         bbe   : int     — cumulative number of black-box evaluations at the time of success.
         f_val : float   — objective value at the success point.
         x     : ndarray of shape (n,) — point in the **original** (unscaled) space.
+        elapsed : float — seconds since the start of the optimization (TIME column).
         """
         #print(f"Succes coordinates in unit space :  {x}")
         x_original = self.scaler.from_unit(x)
         x_str = "  ".join(f"{xi:.17e}" for xi in x_original)
         # with open(self.logfile_path, "a") as f:
         #     f.write(f"{bbe}  {f_val:.17e}  {x_str}\n")
+        fields = {
+            "BBE": f"{bbe}",
+            "OBJ": f"{f_val:.17e}",
+            "TIME": f"{elapsed:.6f}",
+        }
         with open(self.logfile_path, "a") as f:
-            f.write(f"{bbe}  {f_val:.17e} \n")
+            f.write("  ".join(fields[c] for c in self.output_columns) + " \n")
 
     def _update_latent_bound(self, V):
         rad = np.sum(np.abs(V), axis=0)
