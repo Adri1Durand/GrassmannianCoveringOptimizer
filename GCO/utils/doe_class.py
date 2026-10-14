@@ -59,12 +59,32 @@ class DOE:
                 yy = np.full((X.shape[0],), float(yy[0]))
             if yy.shape != (X.shape[0],):
                 raise ValueError("y doit être scalaire ou de taille (m,).")
-            for xi, yi in zip(X, yy):
-                if not self._is_duplicate(xi, tol):
-                    self._add_eval(xi, yi, meta=meta)
+            for i in np.flatnonzero(self._new_point_mask(X, tol)):
+                self._add_eval(X[i], yy[i], meta=meta)
 
         if max_size is not None:
             self._prune_by_density(max_size)
+
+    def _new_point_mask(self, X: np.ndarray, tol: float) -> np.ndarray:
+        """
+        Boolean mask of the rows of X to keep: a row is dropped if it lies within tol of a point already in the DOE
+        or of an earlier kept row of X. Same result as calling _is_duplicate sequentially, with one distance
+        matrix per call instead of one array conversion per point.
+        """
+        from scipy.spatial.distance import cdist
+        m = X.shape[0]
+        keep = np.ones(m, dtype=bool)
+        if self._X:
+            keep &= cdist(X, np.asarray(self._X, dtype=float)).min(axis=1) >= tol
+        if m > 1:
+            Dm = cdist(X, X)
+            kept = []
+            for i in range(m):
+                if keep[i] and kept and np.any(Dm[i, kept] < tol):
+                    keep[i] = False
+                if keep[i]:
+                    kept.append(i)
+        return keep
 
     def _is_duplicate(self, xi: np.ndarray, tol: float) -> bool:
         """
@@ -82,11 +102,11 @@ class DOE:
         Retire des points en excès avec une probabilité inversement
         proportionnelle à la distance au plus proche voisin. Après chaque
         suppression, seuls les points dont le plus proche voisin a été
-        supprimé voient leur distance/probabilité recalculée (les autres
-        restent valides car leur NN n'a pas changé).
+        supprimé voient leur distance/probabilité recalculée.
         Le meilleur point courant (min y) est toujours protégé.
+        The pairwise distance matrix is computed once; removing a point only masks its column.
         """
-        from scipy.spatial import cKDTree
+        from scipy.spatial.distance import cdist
 
         n = len(self._X)
         if n <= max_size:
@@ -97,40 +117,23 @@ class DOE:
         y_arr = np.asarray(self._y, dtype=float)
         best_idx = int(np.argmin(y_arr))
 
-        alive = np.ones(n, dtype=bool)  # masque des points encore présents
+        alive = np.ones(n, dtype=bool)
         eps = 1e-12
 
-        def compute_nn(mask_idx):
-            """Recalcule (index du NN, distance au NN) pour les indices donnés,
-            en cherchant parmi tous les points encore vivants."""
-            alive_idx = np.where(alive)[0]
-            tree = cKDTree(X_arr[alive_idx])
-            # k=2 pour exclure soi-même
-            dists, idx_local = tree.query(X_arr[mask_idx], k=2)
-            nn_local = idx_local[:, 1]
-            nn_dist = dists[:, 1]
-            nn_global = alive_idx[nn_local]
-            return nn_global, nn_dist
-
-        alive_idx0 = np.where(alive)[0]
-        nn_of = np.full(n, -1, dtype=int)      # nn_of[i] = index global du NN de i
-        nn_dist = np.full(n, np.inf)           # distance au NN
-
-        nn_g, nn_d = compute_nn(alive_idx0)
-        nn_of[alive_idx0] = nn_g
-        nn_dist[alive_idx0] = nn_d
+        D = cdist(X_arr, X_arr)
+        np.fill_diagonal(D, np.inf)
+        nn_of = np.argmin(D, axis=1)
+        nn_dist = D[np.arange(n), nn_of]
 
         removed_count = 0
         while removed_count < n_to_remove:
             alive_idx = np.where(alive)[0]
 
             weights = 1.0 / (nn_dist[alive_idx] + eps)
-            # protège le meilleur point
-            weights[alive_idx == best_idx] = 0.0
+            weights[alive_idx == best_idx] = 0.0  # protège le meilleur point
 
             total_w = weights.sum()
             if total_w <= 0:
-                # sécurité : ne devrait arriver que si un seul point reste protégé
                 break
 
             probs = weights / total_w
@@ -138,14 +141,14 @@ class DOE:
             chosen_global = alive_idx[chosen_local]
 
             alive[chosen_global] = False
+            D[:, chosen_global] = np.inf
             removed_count += 1
 
-            # Recalcul uniquement pour les points dont le NN vient d'être supprimé
             affected = np.where((nn_of == chosen_global) & alive)[0]
             if affected.size > 0 and alive.sum() > 1:
-                nn_g, nn_d = compute_nn(affected)
-                nn_of[affected] = nn_g
-                nn_dist[affected] = nn_d
+                sub = D[affected]
+                nn_of[affected] = np.argmin(sub, axis=1)
+                nn_dist[affected] = sub[np.arange(affected.size), nn_of[affected]]
 
         keep_idx = np.where(alive)[0]
         self._X = [self._X[i] for i in keep_idx]

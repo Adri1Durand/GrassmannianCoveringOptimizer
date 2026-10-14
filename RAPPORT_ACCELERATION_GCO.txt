@@ -1,0 +1,65 @@
+RAPPORT : ACCÉLÉRATION DE GCO (fusion de GCO_fast dans GCO/)
+(« GCO original » = copie de test de GCO avant les changements ; « GCO_fast » = copie accélérée ; ces dossiers de test ont été supprimés après fusion dans GCO/.)
+============================================================
+
+1. Résumé
+---------
+- Les accélérations de GCO_fast ont été appliquées à GCO/GCO.py, GCO/utils/doe_class.py et GCO/utils/extended_var.py. Elles ne changent pas
+  l'algorithme, seulement la façon de calculer.
+- Vérification (GCO original vs GCO_fast, PyNomad sans plafond de budget, PLS et Random, 6 fonctions, n = 10, 20, 50, 10 runs par cas,
+  soit 720 runs) : convergence équivalente, 1 différence significative sur 36 cas (p < 0,01).
+- Gain de temps moyen GCO -> GCO_fast : 59 % du temps total (médiane 66 %, min 18 %, max 79 %).
+  Par dimension : n = 10 : 71 % ; n = 20 : 60 % ; n = 50 : 47 %.  Par sélection : PLS 71 % ; Random 47 %.
+- Après fusion, GCO/ et GCO_fast produisent exactement les mêmes évaluations (test à n = 10, graine 1 : 305 évaluations identiques).
+
+2. Ce qui a été fait pour accélérer
+-----------------------------------
+a) Distance chordale sans matrice n x n. Pour S, S' orthonormées à q = p-1 colonnes : ||S S^T - S' S'^T||_F^2 / 2 = q - ||S^T S'||_F^2.
+   Coût 2(n-1)q^2 au lieu de ~2(n-1)^2 q (~35x moins à n = 200, p = 13). (extended_var.py)
+b) Vectorisation sur W et sur les candidats : les S_w sont concaténés dans une matrice (n-1) x (|W| q) et un seul produit matriciel (GEMM)
+   par bloc de 500 candidats donne toutes les distances. Le terme d'ancre ||x - x_w||^2 est calculé une fois. La QR redondante des candidats
+   est supprimée. Une projection admissible à 5000 candidats est 20 à 28x plus rapide (n = 50 à 200).
+c) Tirage des sous-espaces aléatoires (Haar) : un seul tenseur gaussien et une QR par lot, avec un Generator numpy (PCG64) initialisé depuis le flux
+   global (np.random.seed reste valable). Le Generator seul est 2,1x plus rapide que randn ; l'essentiel du gain vient de la vectorisation.
+   Conséquence : les trajectoires ne sont plus identiques bit à bit à l'ancien code pour une même graine (la loi des tirages est la même).
+d) DOE : test de doublons par une seule matrice de distances (cdist) au lieu d'une conversion de liste par point ; élagage (plafond 1000 points)
+   avec une matrice de distances calculée une fois au lieu d'un arbre KD reconstruit à chaque retrait. Même règle de tirage, même résultat.
+   Ajout de 1000 points : 3 à 6x plus rapide ; élagage : 3 à 4x.
+e) anchored_subspace ne reconstruit plus un DOE complet dédupliqué de ~1000 points à chaque itération : un simple conteneur (X, y) suffit à la PLS.
+f) Renommage covering -> exclusion (rayon d'exclusion). Les anciens noms d'options covering_radius_* sont encore acceptés (alias).
+g) Rayon d'exclusion par gradient, MAINTENANT PAR DÉFAUT (exclusion_radius_method="gradient"; "monte_carlo" reste disponible). Le min sur W est lissé
+   par un soft-min pondéré sur TOUS les w (poids exp(-(d_w-d_min)/tau)/d_w, tau = 0,05 d_min), au lieu des seuls w presque actifs. Mesuré sur 8 runs
+   MADS réels (n = 20 à 200) : même valeur que l'ancienne version tronquée (écart < 0,1 %), même temps ; et par rapport au Monte Carlo à 500
+   échantillons : valeur plus haute (1,00 à 1,04 fois le rayon de référence MC à 20000 échantillons, contre 0,99 à 1,00 pour MC500), et 1,3 à 14x
+   plus rapide (0,4 à 2,2 ms par appel contre 1 à 37 ms). Avec MADS le rayon pèse peu dans le temps total, le gain est surtout de précision.
+h) Élagage de W par l'ancre (option W_prune_by_anchor, vrai par défaut). Comme d^2 = r||x-x_w||^2 + (1-r) d_G^2 >= r||x-x_w||^2, un w trop éloigné
+   en x ne peut pas être plus proche que le seuil : on l'écarte avant le calcul de distances. Exact (aucune approximation) pour le test d'admissibilité
+   (seuil gamma h_k), la projection Monte Carlo et le rayon (borne : sqrt(r dx_min^2 + (1-r)(p-1)) ; w le plus proche en x). Vérifié : 0 désaccord
+   sur 300 tests d'admissibilité, rayon Monte Carlo identique au bit près ; le rayon par gradient diffère de 1e-6 en relatif (arrondis).
+   Part de W conservée (runs réels) : n = 50 : 70 à 77 % ; n = 100 : 58 à 72 % ; n = 200 : 14 à 43 % pour le rayon (11 à 34 % pour l'admissibilité).
+   Gain de temps : nul à n <= 50 (le tri coûte autant qu'il économise), donc l'élagage n'est appliqué que si au plus 60 % de W est conservé ;
+   à n = 200, le calcul du rayon est 13 à 32 % plus rapide. Gain global faible : ces calculs pèsent peu avec MADS.
+
+   Élagage approximatif plus agressif pour le rayon (non retenu) : ne garder que les w avec sqrt(r)||x-x_w|| < kappa*h_c (h_c = meilleur candidat
+   initial, kappa = 1,1 à 2), puis réévaluer le S final sur tout W (borne inférieure préservée). Testé sur 8 runs MADS (n = 20 à 200, 20 à 126 appels
+   par run) : valeur du rayon identique à 4 décimales, mais gain de temps de 0 à 6 % (0,4 à 2 ms par appel), donc retiré.
+
+3. Vérification de la convergence (GCO original vs GCO_fast)
+------------------------------------------------------------
+Fonctions : rosenbrock, rastrigin, ackley, decay_ellipsoid, lr2_ellipsoid, lr5_rosenbrock (n = 10, 20, 50 ; p = 3, 4, 8).
+Sous-optimiseur : PyNomad, budget = budget restant, arrêt sur sigma_k. Budget total 100 n. 10 runs par cas.
+Résultats complets : verification_gco_fast.txt (log10 f final moyen ± erreur standard, tests de Welch et Mann-Whitney, temps).
+- 1 cas sur 36 significatif à 1 % (ackley, n = 10, PLS : 0,48 contre 0,61 en log10, légèrement moins bon avec GCO_fast). Avec 36 cas, un
+  faux positif à 1 % est attendu environ 0,4 fois.
+- Différence moyenne de log10 f final (original - fast) : -0,18 (PLS) et -0,14 (Random), soit GCO_fast un peu moins bon en moyenne,
+  mais chaque écart est dans le bruit (écarts-types des runs de 0,3 à 0,7 sur lr2_ellipsoid et lr5_rosenbrock, qui expliquent presque tout).
+- Fraction de runs atteignant f/f0 <= 1e-3 : PLS 88/178 (original) contre 87/179 (fast) ; Random 93/179 contre 89/180.
+- Aucun run tronqué au n = 50 (limite 1500 s).
+
+4. Limites
+----------
+- MADS a été testé sans EVAL_QUEUE_SORT (identique des deux côtés) : ce réglage est recommandé dès la dimension 50, il n'est pas dans la fusion.
+- Les tests ne couvrent pas n >= 100. Les gains y sont mesurés (rapports de microbenchmarks) mais pas la convergence MADS complète.
+- Le gain de temps total dépend de l'évaluation de la fonction : ici les fonctions sont instantanées, donc le gain mesuré est celui de
+  l'overhead de GCO. Avec une boîte noire coûteuse le gain relatif diminue.
+- cobyla_suboptimizer (ajout de la copie de test) n'est pas fusionné.

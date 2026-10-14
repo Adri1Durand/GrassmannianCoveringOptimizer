@@ -114,9 +114,11 @@ class ExtendedVariable:
         -------
         float
         """
-        P1 = S1 @ S1.T
-        P2 = S2 @ S2.T
-        return np.linalg.norm(P1 - P2, ord='fro') / np.sqrt(2)
+        # ||S1 S1^T - S2 S2^T||_F^2 / 2 = k - ||S1^T S2||_F^2 for orthonormal S1, S2 with k columns:
+        # O(n k^2) and no (n x n) projector is built.
+        k = S1.shape[1]
+        M = S1.T @ S2
+        return np.sqrt(max(k - np.sum(M * M), 0.0))
 
     @staticmethod
     def _grassmann_canonical(S1: np.ndarray, S2: np.ndarray) -> float:

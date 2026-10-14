@@ -1,3 +1,4 @@
+import itertools
 import os
 import time
 
@@ -5,11 +6,21 @@ import numpy as np
 from .utils.extended_var import *
 from .utils.doe_class import DOE
 from .utils.domain import BoxScaler
+from .utils.trego import trego
 #from SSO_algo.utils.subspace_class import Subspace
 from .utils.nomad_io import write_nomad_cache, NomadCacheFormat,PointKey
 
 import PyNomad
 import warnings
+
+
+class _XYView :
+    """Minimal read-only (X, y) holder with the Xy() accessor of DOE."""
+    def __init__(self, X, y) :
+        self._X, self._y = X, y
+
+    def Xy(self) :
+        return self._X, self._y
 
 
 class GCO :
@@ -85,8 +96,25 @@ class GCO :
         "subspace_selection": {
             "type": str,
             "default": "PLS",
-            "choices": {"random", "PLS", "Local_PLS"},
+            "choices": {"random", "PLS", "Local_PLS", "mixed"},
             "desc": "Method used to select the subspace matrix S_k on Gr(p-1, n-1).",
+        },
+        "local_pls_factor": {
+            "type": float,
+            "default": 2.0,
+            "desc": ("subspace_selection='Local_PLS': while the DOE holds at most K = ceil(factor*(n-1)) points the PLS uses all of them; beyond, "
+                     "only the K points closest to x_best. 0 = always all points (global PLS)."),
+        },
+        "mixed_random_period": {
+            "type": int,
+            "default": 2,
+            "desc": "subspace_selection='mixed': every period-th iteration uses a random subspace, the others use PLS (0 = never random).",
+        },
+        "mixed_local_factor": {
+            "type": float,
+            "default": 0.0,
+            "desc": ("subspace_selection='mixed': once the DOE holds more than K = ceil(factor*(n-1)) points, the PLS iterations use "
+                     "only the K points closest to x_best (local PLS); before that, all points (global PLS). 0 = always global."),
         },
         "admissible_projection_method": {
             "type": str,
@@ -99,16 +127,42 @@ class GCO :
                 "'riemannian' uses pymanopt to solve the constrained problem."
             ),
         },
-        "covering_radius_method": {
+        "exclusion_radius_method": {
             "type": str,
-            "default": "monte_carlo",
-            "choices": {"monte_carlo", "riemannian"},
+            "default": "gradient",
+            "choices": {"monte_carlo", "riemannian", "gradient"},
             "desc": (
-                "Method used to estimate the covering radius h_k of the visited "
+                "Method used to estimate the exclusion radius h_k of the visited "
                 "extended variable list W. "
                 "'monte_carlo' samples uniformly on the Grassmannian via Haar measure. "
-                "'riemannian' uses pymanopt to maximize the min-distance objective."
+                "'riemannian' uses pymanopt to maximize the min-distance objective. "
+                "'gradient' keeps the best of a few random candidates and improves it by projected gradient ascent on the Grassmannian."
             ),
+        },
+        "W_prune_by_anchor": {
+            "type": bool,
+            "default": True,
+            "desc": "Discard from the history W, in the distance checks, the extended variables whose anchor is too far from the current one to be closer than the threshold (exact, see _restrict_W).",
+        },
+        "exclusion_radius_gradient_init": {
+            "type": int,
+            "default": 20,
+            "desc": "'gradient' exclusion radius: number of random candidates among which the ascent starts (best one).",
+        },
+        "exclusion_radius_gradient_max_iter": {
+            "type": int,
+            "default": 15,
+            "desc": "'gradient' exclusion radius: maximum number of ascent steps (also stops when the gain of a step is below 0.1 %).",
+        },
+        "admissible_projection_n_samples": {
+            "type": int,
+            "default": 5000,
+            "desc": "Number of Haar-distributed candidates drawn by the Monte Carlo admissible projection.",
+        },
+        "exclusion_radius_n_samples": {
+            "type": int,
+            "default": 500,
+            "desc": "Number of Haar-distributed samples used by the Monte Carlo exclusion radius estimate.",
         },
         "contraction" : {
             "type" : float,
@@ -145,6 +199,8 @@ class GCO :
             If an unknown key is passed, a mandatory option is missing,
             a value has the wrong type, or a value is not in the allowed choices.
         """
+        # deprecated names (covering radius -> exclusion radius)
+        user_opt = {k.replace("covering_radius", "exclusion_radius"): v for k, v in user_opt.items()}
         # --- Check for unknown keys ---
         unknown = set(user_opt) - set(cls.OPTIONS_SPEC)
         if unknown:
@@ -241,7 +297,7 @@ class GCO :
         self.K_PENALTY = 100000.0 # Penalty constant for the latent function outside the zonotope
         self.gamma = self.opt.get("gamma", 0.95)
 
-        # self.C_SIGMA = 0.1 # Link between covering radius h_k and the min step size sigma_k of the suboptimizer : sigma_k = C_SIGMA * h_k
+        # self.C_SIGMA = 0.1 # Link between exclusion radius h_k and the min step size sigma_k of the suboptimizer : sigma_k = C_SIGMA * h_k
         self.beta = self.opt["contraction"] # Contraction parameter
         
         # Draw a random discontinuity point in the unit shere.
@@ -295,7 +351,7 @@ class GCO :
             # Get the realisable anchored subspace V_k
             omega_k, h_k = self.anchored_subspace(W, x_best)
 
-            # Update the list of extended variables, and global covering radius
+            # Update the list of extended variables, and global exclusion radius
             W.append(omega_k) 
             h.append(h_k)
             #sigma_k = self.C_SIGMA * h_k
@@ -347,14 +403,15 @@ class GCO :
         """Compute an admissible subspace V_k.
         Udpate the latent function with the new subspace V_k.
         """
-        h_k = self.compute_covering_radius(x_best, W)
-        #print(f"Current covering radius {h_k}")
+        h_k = self.compute_exclusion_radius(x_best, W)
+        #print(f"Current exclusion radius {h_k}")
         if self.update_anchor :
             self._get_anchor_basis(x_best) #basis of x_best perpendicular space
         B = self.anchor_basis
         X, y = self.doe.Xy() 
-        doe_perp = DOE(dim=B.shape[1])
-        doe_perp.add(X@B, y=y)
+        # the main DOE is already duplicate-free, so the perpendicular DOE only needs to expose Xy() for the subspace selection
+        # (rebuilding a deduplicated DOE of ~1000 points at every iteration was a large part of the bookkeeping cost)
+        doe_perp = _XYView(X @ B, y)
         omega_k = self.get_extended_variable(doe_perp, x_best, W, h_k)
         V_k = self.augmentation_isomorphism(omega_k) # From Gr(p-1,n-1) to Gr(p,n)
 
@@ -397,26 +454,19 @@ class GCO :
             S_k = scipy.linalg.orth(S_k)  # ensure orthonormality
 
         elif self.opt["subspace_selection"] == "Local_PLS" :
-            from sklearn.cross_decomposition import PLSRegression as pls
-            import scipy
+            X_perp, y = self._local_data(doe_perp, x_best, self.opt["local_pls_factor"])
+            S_k = self._pls_frame(X_perp, y)
 
-            # Choose the K closest points to x_best
-            K = min(10 * (self.n - 1), len(doe_perp.Xy()[0]))
-            X_full, y_full = self.doe.Xy()
-
-            # Sort by distance to x_best
-            dists = np.linalg.norm(X_full - x_best, axis=1)
-            idx = np.argsort(dists)[:K]
-            X_local = X_full[idx]
-            y_local = y_full[idx]
-
-            # Project into the anchor perpendicular space
-            X_perp_local = X_local @ self.anchor_basis
-
-            _pls = pls(n_components=self.p - 1)
-            S_k = _pls.fit(X_perp_local, y_local).x_rotations_
-            S_k = scipy.linalg.orth(S_k)
-
+        elif self.opt["subspace_selection"] == "mixed":
+            self._sel_count = getattr(self, "_sel_count", 0) + 1
+            period = self.opt["mixed_random_period"]
+            if period > 0 and self._sel_count % period == 0:
+                S_k = np.linalg.qr(np.random.randn(self.n - 1, self.p - 1))[0]
+                self.last_selection = "random"
+            else:
+                X_perp, y = self._local_data(doe_perp, x_best, self.opt["mixed_local_factor"])
+                self.last_selection = "local_PLS" if len(y) < len(doe_perp.Xy()[1]) else "global_PLS"
+                S_k = self._pls_frame(X_perp, y)
         else :
             raise NotImplementedError("Subspace selection method not implemented.")
         omega = ExtendedVariable(x_best,S_k)
@@ -424,14 +474,108 @@ class GCO :
             omega = self._project_into_admissible(omega, W, h_k)
         return omega
 
+    def _local_data(self, doe_perp, x_best, factor):
+        """
+        Data of a local PLS: all the points while the DOE holds at most K = ceil(factor*(n-1)) points (at least p), then only the K
+        points closest to x_best (Euclidean distance in the full space). factor <= 0 keeps every point (global PLS).
+        """
+        X_perp, y = doe_perp.Xy()
+        y = np.asarray(y)
+        K = max(int(np.ceil(factor * (self.n - 1))), self.p)
+        if factor <= 0 or len(y) <= K:
+            return X_perp, y
+        d2 = np.sum((self.doe.Xy()[0] - x_best) ** 2, axis=1)
+        idx = np.argpartition(d2, K - 1)[:K]
+        return X_perp[idx], y[idx]
+
+    def _pls_frame(self, X_perp, y):
+        """Orthonormal (n-1)x(p-1) frame from the PLS x_rotations of (X_perp, y); rank deficiency completed with random vectors."""
+        from sklearn.cross_decomposition import PLSRegression as pls
+        import scipy
+        import warnings
+        n_components = min(self.p - 1, X_perp.shape[0], X_perp.shape[1])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            S_k = pls(n_components).fit(X_perp, y).x_rotations_
+        S_k = scipy.linalg.orth(S_k)
+        deficit = (self.p - 1) - S_k.shape[1]
+        for _ in range(max(deficit, 0)):
+            v = np.random.randn(S_k.shape[0])
+            v -= S_k @ (S_k.T @ v)
+            v /= np.linalg.norm(v)
+            S_k = np.hstack([S_k, v.reshape(-1, 1)])
+        return scipy.linalg.orth(S_k)
+
+    def _W_arrays(self, W):
+        """Stack the visited extended variables: anchors (k, n) and concatenated subspaces (n-1, k*(p-1))."""
+        Xw = np.array([w.x for w in W])
+        Sw = np.concatenate([w.S for w in W], axis=1)
+        return Xw, Sw
+
+    def _restrict_W(self, x, W_arrays, bound):
+        """
+        Keep only the visited extended variables that can be closer than `bound` to (x, S), whatever S.
+        Since d_Omega^2 = r ||x - x_w||^2 + (1-r) d_G^2 >= r ||x - x_w||^2, a w with r ||x - x_w||^2 >= bound^2 is never
+        closer than `bound`: dropping it changes neither the admissibility test (bound = gamma h_k) nor a min distance that
+        is known to be <= bound. Exact (no approximation); it only shortens the history the distances are computed on.
+        """
+        Xw, Sw = W_arrays
+        if not self.opt.get("W_prune_by_anchor", True) or Xw.shape[0] == 0:
+            return W_arrays
+        keep = self.ratio * np.sum((Xw - x[None, :]) ** 2, axis=1) < bound * bound
+        if keep.mean() > 0.6:  # too little to gain: gathering the columns would cost more than it saves
+            return W_arrays
+        q = self.p - 1
+        cols = (np.flatnonzero(keep)[:, None] * q + np.arange(q)[None, :]).ravel()
+        return Xw[keep], Sw[:, cols]
+
+    def _radius_bound(self, x, W_arrays):
+        """Upper bound of min_w d_Omega((x, S), w) valid for every S: the w nearest to x in x, with d_G^2 <= p-1."""
+        Xw, _ = W_arrays
+        r = self.ratio
+        dx2 = np.min(np.sum((Xw - x[None, :]) ** 2, axis=1))
+        return np.sqrt(r * dx2 + (1.0 - r) * (self.p - 1)) * (1.0 + 1e-9) + 1e-12
+
+    def _min_distance_to_W(self, x, S_batch, W_arrays, chunk_bytes=150e6):
+        """
+        min_{w in W} d_Omega((x, S), w) for every S of S_batch (shape (B, n-1, p-1), orthonormal columns).
+        Same quantity as ExtendedVariable.distance (chordal) but computed with one GEMM per chunk:
+            d_G^2(S, S_w) = (p-1) - ||S^T S_w||_F^2,   d_Omega^2 = r ||x - x_w||^2 + (1-r) d_G^2.
+        """
+        Xw, Sw = W_arrays
+        B, _, q = S_batch.shape
+        k = Xw.shape[0]
+        if k == 0:  # no extended variable can be closer than the bound used to discard them
+            return np.full(B, np.inf)
+        r = self.ratio
+        rdx2 = r * np.sum((Xw - x[None, :]) ** 2, axis=1)  # (k,)
+        out = np.empty(B)
+        step = max(1, int(chunk_bytes // (8 * q * q * k)))
+        for i in range(0, B, step):
+            Sb = S_batch[i:i + step]
+            b = Sb.shape[0]
+            G = Sb.transpose(1, 0, 2).reshape(Sb.shape[1], b * q).T @ Sw  # (b*q, k*q)
+            G4 = G.reshape(b, q, k, q)
+            fro2 = np.einsum('bikj,bikj->bk', G4, G4)
+            d2 = rdx2[None, :] + (1.0 - r) * np.maximum(q - fro2, 0.0)
+            out[i:i + b] = np.sqrt(d2.min(axis=1))
+        return out
+
+    def _sample_grassmann(self, n_samples):
+        """n_samples orthonormal (n-1, p-1) frames, Haar distributed (Gaussian matrices + QR)."""
+        # a Generator seeded from the global stream (reproducible with np.random.seed) is ~2x faster than legacy randn (measured: 2.1x on 5000 candidates)
+        rng = np.random.default_rng(np.random.randint(0, 2**31 - 1))
+        Z = rng.standard_normal((n_samples, self.n - 1, self.p - 1))
+        Q, _ = np.linalg.qr(Z)
+        return Q
+
     def _is_admissible(self, omega , W, h_k) :
         """Check if the subspace V_k is belong to restricted anchored space."""
-        #print(f"Relaxed exclusion radius : {self.gamma* h_k}")
-        for w in W :
-            #print(f"Actual distance to this neighboor {omega.distance(w, r=self.ratio, metric=GrassmannMetric.CHORDAL)}")
-            if omega.distance(w, r=self.ratio, metric=GrassmannMetric.CHORDAL) < self.gamma * h_k :
-                return False
-        return True
+        if len(W) == 0 :
+            return True
+        W_arrays = self._restrict_W(omega.x, self._W_arrays(W), self.gamma * h_k)
+        d = self._min_distance_to_W(omega.x, omega.S[None, :, :], W_arrays)[0]
+        return not (d < self.gamma * h_k)
 
     def _orthobasis(self, X):
         """Compute an orthonormal basis of the subspace spanned by the columns of X."""
@@ -484,7 +628,7 @@ class GCO :
         W : list of ExtendedVariable
             List of already visited extended variables.
         h_k : float
-            Covering radius lower bound (admissibility threshold).
+            Exclusion radius lower bound (admissibility threshold).
 
         Returns
         -------
@@ -520,29 +664,33 @@ class GCO :
         ExtendedVariable
         """
         n_samples = self.opt.get("admissible_projection_n_samples", 5000)
+        thr = self.gamma * h_k
+        W_arrays = self._restrict_W(omega.x, self._W_arrays(W), thr)
+        q = self.p - 1
+        r = self.ratio
 
         best_S = None
         best_dist = np.inf
-
-        for _ in range(n_samples):
-            S_raw = np.random.randn(self.n - 1, self.p - 1)
-            Q, _ = np.linalg.qr(S_raw)
-            S_candidate = Q[:, : self.p - 1]
-
-            omega_candidate = ExtendedVariable(x=omega.x, S=S_candidate)
-
-            if self._is_admissible(omega_candidate, W, h_k):
-                #dist_to_Sk = omega_candidate._grassmann_distance(omega, metric=GrassmannMetric.CHORDAL)
-                dist_to_Sk = omega_candidate.distance(omega,r=self.ratio, metric = GrassmannMetric.CHORDAL)
-                if dist_to_Sk < best_dist:
-                    best_dist = dist_to_Sk
-                    best_S = S_candidate
+        chunk = 500
+        for i in range(0, n_samples, chunk):
+            Sc = self._sample_grassmann(min(chunk, n_samples - i))
+            dmin = self._min_distance_to_W(omega.x, Sc, W_arrays)
+            adm = ~(dmin < thr)
+            if not adm.any():
+                continue
+            Sa = Sc[adm]
+            M = np.matmul(Sa.transpose(0, 2, 1), omega.S)
+            d_to_Sk = np.sqrt((1.0 - r) * np.maximum(q - np.einsum('bij,bij->b', M, M), 0.0))
+            j = int(np.argmin(d_to_Sk))
+            if d_to_Sk[j] < best_dist:  # strict: first minimum wins, like the sequential loop
+                best_dist = d_to_Sk[j]
+                best_S = Sa[j]
 
         if best_S is None:
             raise RuntimeError(
                 f"No admissible subspace found after {n_samples} Monte Carlo samples. "
                 "Consider increasing 'admissible_projection_n_samples' or "
-                "checking the covering radius computation."
+                "checking the exclusion radius computation."
             )
 
         return ExtendedVariable(x=omega.x, S=best_S)
@@ -575,7 +723,7 @@ class GCO :
                 "Install it with: pip install pymanopt"
             )
 
-        tau = self.opt.get("covering_radius_softmin_tau", 0.05)
+        tau = self.opt.get("exclusion_radius_softmin_tau", 0.05)
         n_restarts = self.opt.get("admissible_projection_n_restarts", 5)
 
         manifold = Grassmann(self.n - 1, self.p - 1) # Anchored subspace isomorphic to Gr(p-1,R^{n-1})
@@ -652,12 +800,12 @@ class GCO :
         self.discontinuity_basis = self._orthogonal_complement_basis(self.discontinuity_point)
         return self
 
-    def compute_covering_radius(self, x_best: np.ndarray, W: list) -> float:
+    def compute_exclusion_radius(self, x_best: np.ndarray, W: list) -> float:
         """
-        Estimate the covering radius h_k of the current extended variable list W,
+        Estimate the exclusion radius h_k of the current extended variable list W,
         at anchor point x_best.
 
-        The covering radius is defined as:
+        The exclusion radius is defined as:
             h_k = sup_{S in Gr(p-1, n-1)} min_{w in W} d_Omega((x_best, S), w)
 
         Parameters
@@ -670,26 +818,28 @@ class GCO :
         Returns
         -------
         float
-            Estimated covering radius h_k.
+            Estimated exclusion radius h_k.
         """
         if len(W) == 0:
-            return self.h_0#self.opt.get("initial_covering_radius", 1.0)
+            return self.h_0#self.opt.get("initial_exclusion_radius", 1.0)
 
-        method = self.opt.get("covering_radius_method", "monte_carlo")
+        method = self.opt.get("exclusion_radius_method", "gradient")
 
         if method == "monte_carlo":
-            return self._covering_radius_mc(x_best, W)
+            return self._exclusion_radius_mc(x_best, W)
         elif method == "riemannian":
-            return self._covering_radius_riemannian(x_best, W)
+            return self._exclusion_radius_riemannian(x_best, W)
+        elif method == "gradient":
+            return self._exclusion_radius_gradient(x_best, W)
         else:
             raise ValueError(
-                f"Unknown covering radius method '{method}'. "
+                f"Unknown exclusion radius method '{method}'. "
                 "Choose 'monte_carlo' or 'riemannian'."
             )
 
-    def _covering_radius_mc(self, x_best: np.ndarray, W: list) -> float:
+    def _exclusion_radius_mc(self, x_best: np.ndarray, W: list) -> float:
         """
-        Monte Carlo estimate of the covering radius by uniform sampling
+        Monte Carlo estimate of the exclusion radius by uniform sampling
         over Gr(p-1, n-1) via Haar measure (QR decomposition of Gaussian matrices).
 
         Parameters
@@ -701,27 +851,72 @@ class GCO :
         -------
         float
         """
-        n_samples = self.opt.get("covering_radius_n_samples", 500)
-        max_min_dist = -np.inf
+        n_samples = self.opt.get("exclusion_radius_n_samples", 500)
+        W_arrays = self._W_arrays(W)
+        W_arrays = self._restrict_W(x_best, W_arrays, self._radius_bound(x_best, W_arrays))
+        S_sample = self._sample_grassmann(n_samples)
+        return float(np.max(self._min_distance_to_W(x_best, S_sample, W_arrays)))
 
-        for _ in range(n_samples):
-            S_raw = np.random.randn(self.n - 1, self.p - 1)
-            Q, _ = np.linalg.qr(S_raw)
-            S_sample = Q[:, : self.p - 1]
-
-            omega_sample = ExtendedVariable(x=x_best, S=S_sample)
-            min_dist = min(
-                omega_sample.distance(w, r=self.ratio, metric=GrassmannMetric.CHORDAL)
-                for w in W
-            )
-            if min_dist > max_min_dist:
-                max_min_dist = min_dist
-
-        return max_min_dist
-
-    def _covering_radius_riemannian(self, x_best: np.ndarray, W: list) -> float:
+    def _exclusion_radius_gradient(self, x_best: np.ndarray, W: list) -> float:
         """
-        Riemannian optimization estimate of the covering radius using pymanopt.
+        Estimate h_k = max_S min_w d((x_best, S), w) by projected gradient ascent on the Grassmannian.
+
+        Start: best of `exclusion_radius_gradient_init` Haar candidates. The min over w is smoothed by a soft-min over ALL the
+        (remaining) w: ascent direction = sum over w of the gradients of d_w with weights exp(-(d_w - d_min)/tau) / d_w,
+        tau = 0.05 d_min, where
+            grad_S d_w = -(1-r) S_w (S_w^T S) / d_w,
+        projected on the tangent space (I - S S^T) and followed by a QR retraction; adaptive step (doubled on success,
+        halved on failure), accepted only if the true min distance increases. Like Monte Carlo it returns a lower bound of h_k.
+        The history is first restricted to the w that can matter (see _restrict_W).
+        """
+        r = self.ratio
+        q = self.p - 1
+        W_arrays = self._W_arrays(W)
+        Xw, Sw = self._restrict_W(x_best, W_arrays, self._radius_bound(x_best, W_arrays))
+        k = Xw.shape[0]
+        rdx2 = r * np.sum((Xw - x_best[None, :]) ** 2, axis=1)
+
+        def dists(S):
+            SwS = Sw.T @ S  # (k q, q), also used for the gradient
+            M = SwS.reshape(k, q, q)
+            fro2 = np.einsum('kij,kij->k', M, M)
+            return np.sqrt(np.maximum(rdx2 + (1.0 - r) * np.maximum(q - fro2, 0.0), 0.0)), SwS
+
+        cand = self._sample_grassmann(self.opt.get("exclusion_radius_gradient_init", 20))
+        dmin_c = self._min_distance_to_W(x_best, cand, (Xw, Sw))
+        S = cand[int(np.argmax(dmin_c))]
+        d, SwS = dists(S)
+        best = d.min()
+        step = 0.3
+        for _ in range(self.opt.get("exclusion_radius_gradient_max_iter", 30)):
+            dm = d.min()
+            tau = 0.05 * max(dm, 1e-8)
+            wgt = np.exp(-(d - dm) / tau) / np.maximum(d, 1e-8)
+            D = -(1.0 - r) * Sw @ (np.repeat(wgt, q)[:, None] * SwS)
+            D -= S @ (S.T @ D)
+            nD = np.linalg.norm(D)
+            if nD < 1e-14:
+                break
+            ok = False
+            for _ in range(6):  # backtracking
+                S_new = np.linalg.qr(S + (step / nD) * D)[0]
+                d_new, SwS_new = dists(S_new)
+                if d_new.min() > best:
+                    ok = True
+                    break
+                step *= 0.5
+            if not ok:
+                break
+            gain = d_new.min() - best
+            S, d, SwS, best = S_new, d_new, SwS_new, d_new.min()
+            step *= 2.0
+            if gain < 1e-3 * best:
+                break
+        return float(best)
+
+    def _exclusion_radius_riemannian(self, x_best: np.ndarray, W: list) -> float:
+        """
+        Riemannian optimization estimate of the exclusion radius using pymanopt.
         Maximizes min_{w in W} d_Omega((x_best, S), w) over S in Gr(p-1, n-1).
 
         Since pymanopt minimizes, we minimize the negative of the objective.
@@ -743,12 +938,12 @@ class GCO :
             from pymanopt.optimizers import SteepestDescent, TrustRegions, NelderMead
         except ImportError:
             raise ImportError(
-                "pymanopt is required for the 'riemannian' covering radius method. "
+                "pymanopt is required for the 'riemannian' exclusion radius method. "
                 "Install it with: pip install pymanopt"
             )
 
-        tau = self.opt.get("covering_radius_softmin_tau", 0.05)
-        n_restarts = self.opt.get("covering_radius_n_restarts", 5)
+        tau = self.opt.get("exclusion_radius_softmin_tau", 0.05)
+        n_restarts = self.opt.get("exclusion_radius_n_restarts", 5)
 
         manifold = Grassmann(self.n - 1, self.p - 1)
 
@@ -873,6 +1068,14 @@ class GCO :
         self.latent_doe.add(X_keep @ V_k, y=y_keep)
         return self
 
+    @staticmethod
+    def _projection_residuals(X: np.ndarray, V_k: np.ndarray) -> np.ndarray:
+        """||x - V_k V_k^T x|| for each row x of X, computed in O(N n p) without the n-dim projections
+        (Pythagoras: ||x||^2 - ||V_k^T x||^2, V_k having orthonormal columns)."""
+        XV = X @ V_k
+        sq = np.einsum('ij,ij->i', X, X) - np.einsum('ij,ij->i', XV, XV)
+        return np.sqrt(np.maximum(sq, 0.0))
+
     def _select_cache_points(self, X: np.ndarray, y: np.ndarray, V_k: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
         Reduce the DOE history to at most max_cache_point points, to respect
@@ -903,11 +1106,11 @@ class GCO :
         residuals = None
 
         if threshold is not None:
-            X_proj = X @ V_k @ V_k.T
-            residuals = np.linalg.norm(X_proj - X, axis=1)
+            residuals = GCO._projection_residuals(X, V_k)
             eligible = residuals <= threshold
             X = X[eligible]
             y = y[eligible]
+            residuals = residuals[eligible] # keep residuals aligned with the filtered X, y
             n_points = X.shape[0]
 
             if n_points == 0:
@@ -928,8 +1131,7 @@ class GCO :
         elif method == "closest_subspace":
             # Residual of orthogonal projection onto span(V_k): ||V_k V_k^T x - x||
             if residuals is None:
-                X_proj = X @ V_k @ V_k.T
-                residuals = np.linalg.norm(X_proj - X, axis=1)
+                residuals = GCO._projection_residuals(X, V_k)
             idx = np.argsort(residuals)[:max_points]
 
         else:
@@ -1080,10 +1282,23 @@ def doe_to_rounded_map(doe: DOE, decimals: int) -> dict[PointKey, float]:
             out[key] = val
     return out
 
-def trego_suboptimizer(fun, sigma_k) :
-    """Optimize the function fun with Trego, with a min step size of sigma_k.
+_trego_calls = itertools.count()  # successive calls get different (but reproducible) seeds
+
+def trego_suboptimizer(fun, sigma_k, initial_doe, budget=None, ub=None, lb=None, stat_file=None, cache_name=None,
+                       seed=None, G=1, L=4, beta=0.5, tsigma_0=0.05, refit_every=3, max_train=100) :
+    """Optimize the function fun with TREGO (see utils/trego.py), with a min trust-region size derived from sigma_k.
+    The initial_doe is used to warm start the GP but is not counted nor returned.
+    Like MADS, there is no evaluation cap if budget is None and sigma_k is given (the run stops when the
+    trust-region size tsigma falls below sigma_k); if both are None the budget is 5*p. An explicit budget is always honoured.
+    tsigma_0 is the initial trust-region size (float, or callable of the normalised minimum size).
+    stat_file and cache_name are accepted and ignored.
+    If seed is None, a call counter is used so that successive calls differ but runs are reproducible.
     Return array of evaluated points Xk, array of evaluated values Fk, and number of evaluations n_eval.
     """
+    if seed is None :
+        seed = next(_trego_calls)
+    return trego(fun, initial_doe, lb, ub, tsigma_min=sigma_k, budget=budget, seed=seed,
+                 G=G, L=L, beta=beta, tsigma_0=tsigma_0, refit_every=refit_every, max_train=max_train)
 
 if __name__ == "__main__" :
     import sys
