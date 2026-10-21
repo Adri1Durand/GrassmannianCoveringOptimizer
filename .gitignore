@@ -1,10 +1,48 @@
-*.egg-info/
+# The repository only contains the GCO package and what is needed to install and use it:
+#   GCO/, README.md, README.txt, pyproject.toml, requirements.txt, .gitignore
+# Everything else (tests, studies, benchmark results, reports, run logs) stays local.
+
+# ---- tests, studies, results and reports (local only)
+/test_*/
+/results/
+/GCO_*.py
+/RAPPORT_*.txt
+/verification_*.txt
+/*.pdf
+/*.txt
+!/README.txt
+!/requirements.txt
+
+# ---- files written by GCO / NOMAD when an optimization runs
+log_GCO.txt
+GCO_example_log.txt
+cache_*.txt
+cache_file.txt
+x0.txt
+nomad*.log
+
+# ---- Python, build, environments
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
 .venv/
 .pytest_cache/
-log_GCO.txt
-cache_file.txt
-nomad*.log
+
+# ---- cluster logs, LaTeX intermediate files
 *.out
 slurm-*.out
+*.aux
+*.log
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+
+# ---- editors, assistants, OS
+.claude/
+.vscode/
+.idea/
+*.swp
+.DS_Store
